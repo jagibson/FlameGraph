@@ -119,6 +119,10 @@ my $pal_file = "palette.map";   # palette map file name
 my $stackreverse = 0;           # reverse stack order, switching merge end
 my $inverted = 0;               # icicle graph
 my $flamechart = 0;             # produce a flame chart (sort by time, do not merge stacks)
+my $presorted = 0;              # input is already sorted, skip sorting
+my $progress = 0;               # show progress percentage
+my $gnusort = 0;                # use GNU sort (gsort) instead of system sort
+my $parallel = 0;               # number of parallel threads for GNU sort
 my $negate = 0;                 # switch differential hues
 my $titletext = "";             # centered heading
 my $titledefault = "Flame Graph";	# overwritten by --title
@@ -152,6 +156,10 @@ USAGE: $0 [options] infile > outfile.svg\n
 	--reverse        # generate stack-reversed flame graph
 	--inverted       # icicle graph
 	--flamechart     # produce a flame chart (sort by time, do not merge stacks)
+	--presorted      # input is already sorted, skip sorting step
+	--progress       # show progress percentage during processing
+	--gnu-sort       # use GNU sort (gsort) instead of system sort (faster for very large files on macOS)
+	--parallel NUM   # number of parallel threads for GNU sort (requires --gnu-sort)
 	--negate         # switch differential hues (blue<->red)
 	--notes TEXT     # add notes comment in SVG (for debugging)
 	--help           # this message
@@ -184,6 +192,10 @@ GetOptions(
 	'reverse'     => \$stackreverse,
 	'inverted'    => \$inverted,
 	'flamechart'  => \$flamechart,
+	'presorted'   => \$presorted,
+	'progress'    => \$progress,
+	'gnu-sort'    => \$gnusort,
+	'parallel=i'  => \$parallel,
 	'negate'      => \$negate,
 	'notes=s'     => \$notestext,
 	'help'        => \$help,
@@ -641,51 +653,251 @@ my $ignored = 0;
 my $line;
 my $maxdelta = 1;
 
-# reverse if needed
-foreach (<>) {
-	chomp;
-	$line = $_;
-	if ($stackreverse) {
-		# there may be an extra samples column for differentials
-		# XXX todo: redo these REs as one. It's repeated below.
-		my($stack, $samples) = (/^(.*)\s+?(\d+(?:\.\d*)?)$/);
-		my $samples2 = undef;
-		if ($stack =~ /^(.*)\s+?(\d+(?:\.\d*)?)$/) {
-			$samples2 = $samples;
-			($stack, $samples) = $stack =~ (/^(.*)\s+?(\d+(?:\.\d*)?)$/);
-			unshift @Data, join(";", reverse split(";", $stack)) . " $samples $samples2";
-		} else {
-			unshift @Data, join(";", reverse split(";", $stack)) . " $samples";
+# Pre-compile frequently used regular expressions for performance
+my $stack_samples_re = qr/^(.*)\s+?(\d+(?:\.\d*)?)$/;
+my $number_re = qr/^(\d+(?:\.\d*)?)$/;
+
+# Determine if we should use external sort
+# Use external sort unless presorted/flamechart, for both files and stdin
+my $use_external_sort = 0;
+my $input_file;
+my $sort_cmd;
+
+# Use GNU sort (gsort) if requested via --gnu-sort flag
+my $sort_binary = "sort";
+my $sort_options = "";
+if ($gnusort) {
+	if (system("which gsort >/dev/null 2>&1") == 0) {
+		$sort_binary = "gsort";
+		# Add parallel option if specified
+		if ($parallel > 0) {
+			$sort_options = "--parallel=$parallel";
 		}
 	} else {
-		unshift @Data, $line;
+		warn "Warning: --gnu-sort specified but gsort not found, using system sort\n";
+	}
+} elsif ($parallel > 0) {
+	warn "Warning: --parallel specified but requires --gnu-sort, ignoring\n";
+}
+
+# Check if pv (pipe viewer) is available for sort progress
+my $pv_available = (system("which pv >/dev/null 2>&1") == 0);
+
+if (!$presorted && !$flamechart) {
+	if (@ARGV == 1 && -f $ARGV[0]) {
+		# File input: use external sort for files > 100MB
+		$input_file = $ARGV[0];
+		my $file_size = -s $input_file;
+		my $is_gzip = ($input_file =~ /\.gz$/i);
+
+		if ($file_size > 100_000_000 || $is_gzip) {
+			$use_external_sort = 1;
+			if ($is_gzip) {
+				# Decompress gzip on the fly and pipe to sort
+				if ($progress && $pv_available) {
+					# Use pv to show decompression progress
+					$sort_cmd = "gzip -dc \Q$input_file\E | pv -N 'Decompressing' | $sort_binary $sort_options";
+				} else {
+					$sort_cmd = "gzip -dc \Q$input_file\E | $sort_binary $sort_options";
+				}
+				warn "Gzip compressed file detected (", int($file_size/1024/1024), " MB compressed), using external sort with decompression",
+				     ($sort_binary eq "gsort" ? " (GNU sort" . ($parallel > 0 ? ", $parallel threads" : "") . ")" : ""),
+				     ($progress && $pv_available ? " [pv enabled]" : ""), "...\n";
+			} else {
+				# Regular file
+				if ($progress && $pv_available) {
+					# Use pv to show progress while reading file for sort
+					$sort_cmd = "pv -N 'Reading' \Q$input_file\E | $sort_binary $sort_options";
+				} else {
+					$sort_cmd = "$sort_binary $sort_options \Q$input_file\E";
+				}
+				warn "Large file detected (", int($file_size/1024/1024), " MB), using external sort",
+				     ($sort_binary eq "gsort" ? " (GNU sort" . ($parallel > 0 ? ", $parallel threads" : "") . ")" : ""),
+				     ($progress && $pv_available ? " [pv enabled]" : ""), "...\n";
+			}
+		}
+	} elsif (@ARGV == 0 || (@ARGV == 1 && $ARGV[0] eq '-')) {
+		# stdin input: always use external sort (we don't know size)
+		$use_external_sort = 1;
+		if ($progress && $pv_available) {
+			# Use pv to show throughput from stdin
+			$sort_cmd = "pv -N 'stdin' | $sort_binary $sort_options";
+		} else {
+			$sort_cmd = "$sort_binary $sort_options";
+		}
+		warn "Using external sort for stdin input",
+		     ($sort_binary eq "gsort" ? " (GNU sort" . ($parallel > 0 ? ", $parallel threads" : "") . ")" : ""),
+		     ($progress && $pv_available ? " [pv enabled]" : ""), "...\n";
 	}
 }
 
-if ($flamechart) {
-	# In flame chart mode, just reverse the data so time moves from left to right.
-	@SortedData = reverse @Data;
+# Process input with external sort if enabled
+if ($use_external_sort) {
+	# Count total lines for progress tracking (if enabled and file input)
+	my $sort_total_lines = 0;
+	my $sort_processed_lines = 0;
+	my $sort_last_progress = -1;
+
+	if ($progress && $input_file) {
+		warn "Counting lines for progress tracking...\n";
+		my $is_gzip = ($input_file =~ /\.gz$/i);
+		if ($is_gzip) {
+			# Count lines in gzip file by decompressing
+			open(my $count_fh, '-|', 'gzip', '-dc', $input_file) or die "Can't decompress $input_file: $!";
+			$sort_total_lines++ while <$count_fh>;
+			close($count_fh);
+		} else {
+			open(my $count_fh, '<', $input_file) or die "Can't open $input_file: $!";
+			$sort_total_lines++ while <$count_fh>;
+			close($count_fh);
+		}
+		warn "Sort phase: processing $sort_total_lines lines...\n";
+	}
+
+	# Read directly from sorted pipe
+	open(my $sorted_fh, '-|', 'sh', '-c', $sort_cmd) or die "Can't run external sort: $!";
+	while (my $sorted_line = <$sorted_fh>) {
+		chomp $sorted_line;
+
+		# Update sort progress
+		if ($progress) {
+			$sort_processed_lines++;
+			if ($sort_total_lines > 0) {
+				my $sort_progress = int(($sort_processed_lines / $sort_total_lines) * 100);
+				if ($sort_progress != $sort_last_progress &&
+				    ($sort_progress % 5 == 0 || $sort_processed_lines % 100000 == 0)) {
+					printf STDERR "Sort progress: %d%% (%d/%d lines)\r",
+					            $sort_progress, $sort_processed_lines, $sort_total_lines;
+					$sort_last_progress = $sort_progress;
+				}
+			} elsif ($sort_processed_lines % 100000 == 0) {
+				# For stdin, just show count every 100k lines
+				printf STDERR "Sort progress: %d lines processed\r", $sort_processed_lines;
+			}
+		}
+
+		if ($stackreverse) {
+			# Optimized parsing: one regex, then check for second number using rindex/substr
+			my ($stack, $samples) = ($sorted_line =~ $stack_samples_re);
+			my $samples2 = undef;
+			if (defined $stack) {
+				my $last_space = rindex($stack, ' ');
+				if ($last_space >= 0) {
+					my $potential_num = substr($stack, $last_space + 1);
+					if ($potential_num =~ $number_re) {
+						$samples2 = $samples;
+						$samples = $potential_num;
+						$stack = substr($stack, 0, $last_space);
+					}
+				}
+				my $reversed = join(";", reverse split(";", $stack));
+				if (defined $samples2) {
+					push @SortedData, "$reversed $samples $samples2";
+				} else {
+					push @SortedData, "$reversed $samples";
+				}
+			}
+		} else {
+			push @SortedData, $sorted_line;
+		}
+	}
+	close($sorted_fh);
+
+	if ($progress && $sort_total_lines > 0) {
+		printf STDERR "Sort progress: 100%% (%d/%d lines) - Complete!\n",
+		            $sort_total_lines, $sort_total_lines;
+	} elsif ($progress && $sort_processed_lines > 0) {
+		printf STDERR "Sort progress: %d lines processed - Complete!\n", $sort_processed_lines;
+	}
 } else {
-	@SortedData = sort @Data;
+	# Standard processing: read all input into memory
+	foreach (<>) {
+		chomp;
+		$line = $_;
+		if ($stackreverse) {
+			# Optimized parsing: one regex, then check for second number using rindex/substr
+			my ($stack, $samples) = (/$stack_samples_re/);
+			my $samples2 = undef;
+			if (defined $stack) {
+				my $last_space = rindex($stack, ' ');
+				if ($last_space >= 0) {
+					my $potential_num = substr($stack, $last_space + 1);
+					if ($potential_num =~ $number_re) {
+						$samples2 = $samples;
+						$samples = $potential_num;
+						$stack = substr($stack, 0, $last_space);
+					}
+				}
+				my $reversed = join(";", reverse split(";", $stack));
+				if (defined $samples2) {
+					unshift @Data, "$reversed $samples $samples2";
+				} else {
+					unshift @Data, "$reversed $samples";
+				}
+			}
+		} else {
+			unshift @Data, $line;
+		}
+	}
+
+	if ($flamechart) {
+		# In flame chart mode, just reverse the data so time moves from left to right.
+		@SortedData = reverse @Data;
+	} elsif ($presorted) {
+		# Input is already sorted, skip sorting
+		@SortedData = @Data;
+	} else {
+		@SortedData = sort @Data;
+	}
 }
 
 # process and merge frames
+my $total_lines = scalar @SortedData;
+my $processed_lines = 0;
+my $last_progress = -1;
+
+if ($progress && $total_lines > 0) {
+	warn "Processing $total_lines lines...\n";
+}
+
 foreach (@SortedData) {
 	chomp;
+
+	# Update progress
+	if ($progress && $total_lines > 0) {
+		$processed_lines++;
+		my $current_progress = int(($processed_lines / $total_lines) * 100);
+		# Report every 5% or every 100k lines
+		if ($current_progress != $last_progress &&
+		    ($current_progress % 5 == 0 || $processed_lines % 100000 == 0)) {
+			printf STDERR "Progress: %d%% (%d/%d lines)\r",
+			            $current_progress, $processed_lines, $total_lines;
+			$last_progress = $current_progress;
+		}
+	}
 	# process: folded_stack count
 	# eg: func_a;func_b;func_c 31
-	my ($stack, $samples) = (/^(.*)\s+?(\d+(?:\.\d*)?)$/);
+	# or: func_a;func_b;func_c 25 31 (differential with two counts)
+	# Optimized: parse once, then check if stack has another trailing number
+	my ($stack, $samples) = (/$stack_samples_re/);
 	unless (defined $samples and defined $stack) {
 		++$ignored;
 		next;
 	}
 
-	# there may be an extra samples column for differentials:
+	# Check for differential format by looking for trailing number in stack
 	my $samples2 = undef;
-	if ($stack =~ /^(.*)\s+?(\d+(?:\.\d*)?)$/) {
-		$samples2 = $samples;
-		($stack, $samples) = $stack =~ (/^(.*)\s+?(\d+(?:\.\d*)?)$/);
+	my $last_space = rindex($stack, ' ');
+	if ($last_space >= 0) {
+		my $potential_num = substr($stack, $last_space + 1);
+		if ($potential_num =~ $number_re) {
+			$samples2 = $samples;
+			$samples = $potential_num;
+			$stack = substr($stack, 0, $last_space);
+		}
 	}
+
+	# Calculate delta for differentials
 	$delta = undef;
 	if (defined $samples2) {
 		$delta = $samples2 - $samples;
@@ -717,6 +929,11 @@ foreach (@SortedData) {
 	}
 }
 flow($last, [], $time, $delta);
+
+if ($progress && $total_lines > 0) {
+	warn sprintf("Progress: 100%% (%d/%d lines) - Complete!\n",
+	            $total_lines, $total_lines);
+}
 
 if ($countname eq "samples") {
 	# If $countname is used, it's likely that we're not measuring in stack samples
