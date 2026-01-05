@@ -1,0 +1,6 @@
+/*.svg
+/*.out
+/*.gz
+/*.csv
+
+!/example*
